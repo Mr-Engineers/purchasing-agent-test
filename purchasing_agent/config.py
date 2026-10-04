@@ -47,8 +47,12 @@ class Settings(BaseSettings):
     # Sent to the warehouse as X-On-Behalf-Of in direct mode (the proxy sets it otherwise)
     agent_id: str = "purchasing-agent"
 
+    poll_interval_s: float = 30
     max_parallel_sessions: int = 4
     max_llm_steps: int = 10
+    # A SKU whose session ended without an order is not retried before this
+    sku_retry_cooldown_s: float = 300
+    run_once: bool = False
 
     http_timeout_s: float = 30
     # Retries on 502/503/504 and connection errors (D14); never on 403
