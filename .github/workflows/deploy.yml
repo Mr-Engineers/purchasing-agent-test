@@ -1,0 +1,65 @@
+name: Build & Deploy to ECS
+
+on:
+  workflow_dispatch:
+
+env:
+  AWS_REGION: eu-north-1
+  ECR_REPOSITORY: one-dev-ai-agent-direct
+  ECS_CLUSTER: one-dev-cluster
+  # Direct agent (tests): test-backend, backend-2 and Bedrock without proxy-server
+  ECS_SERVICES: one-dev-ai-agent-direct
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::206135621036:role/one-dev-github-deploy-ai-agent-direct
+          aws-region: ${{ env.AWS_REGION }}
+          audience: sts.amazonaws.com
+
+      - name: Login to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set image tag (current date)
+        run: |
+          echo "IMAGE=${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}" >> $GITHUB_ENV
+          echo "IMAGE_TAG=$(TZ=Europe/Warsaw date +'%Y-%m-%d_%H_%M')" >> $GITHUB_ENV
+
+      - name: Build
+        run: |
+          docker build \
+            -t ${{ env.IMAGE }}:${{ env.IMAGE_TAG }} \
+            -t ${{ env.IMAGE }}:latest .
+
+      - name: Push
+        run: |
+          docker push ${{ env.IMAGE }}:${{ env.IMAGE_TAG }}
+          docker push ${{ env.IMAGE }}:latest
+          echo "Pushed: \`${{ env.IMAGE }}:${{ env.IMAGE_TAG }}\` and \`${{ env.IMAGE }}:latest\`" >> $GITHUB_STEP_SUMMARY
+
+      - name: Deploy to ECS
+        run: |
+          for service in ${{ env.ECS_SERVICES }}; do
+            aws ecs update-service \
+              --cluster ${{ env.ECS_CLUSTER }} \
+              --service "$service" \
+              --force-new-deployment \
+              --query 'service.deployments[0].id' --output text
+          done
+          aws ecs wait services-stable \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --services ${{ env.ECS_SERVICES }}
+          echo "Deployed to ECS services \`${{ env.ECS_SERVICES }}\`" >> $GITHUB_STEP_SUMMARY
