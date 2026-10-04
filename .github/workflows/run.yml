@@ -1,0 +1,94 @@
+name: Run agent
+
+on:
+  workflow_dispatch:
+
+# Starts the agent once as a one-off ECS task (no service, nothing restarts it): one scan
+# of the warehouse, one restock session per low-stock SKU, exit. Waits for the task,
+# prints its logs and fails when the agent exits with a non-zero code.
+# Network values come from `terraform output ai_agent_direct_run_task` (one-infrastructure).
+
+env:
+  AWS_REGION: eu-north-1
+  ECS_CLUSTER: one-dev-cluster
+  TASK_DEFINITION: one-dev-ai-agent-direct
+  SUBNETS: subnet-0186517c770d6a70a,subnet-0747224d2e50907e9
+  SECURITY_GROUP: sg-035343da553a315f4
+  LOG_GROUP: /ecs/one-dev/ai-agent-direct
+  # Container name and awslogs-stream-prefix in the task definition
+  LOG_STREAM_PREFIX: ai-agent/ai-agent
+
+permissions:
+  id-token: write
+  contents: read
+
+# Two agents at once would order the same SKUs
+concurrency:
+  group: run-agent
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 70
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::206135621036:role/one-dev-github-deploy-ai-agent-direct
+          aws-region: ${{ env.AWS_REGION }}
+          audience: sts.amazonaws.com
+
+      - name: Start task
+        run: |
+          TASK_ARN=$(aws ecs run-task \
+            --cluster "$ECS_CLUSTER" \
+            --task-definition "$TASK_DEFINITION" \
+            --launch-type FARGATE \
+            --count 1 \
+            --started-by "github-run-${{ github.run_id }}" \
+            --network-configuration "awsvpcConfiguration={subnets=[$SUBNETS],securityGroups=[$SECURITY_GROUP],assignPublicIp=DISABLED}" \
+            --query 'tasks[0].taskArn' --output text)
+          if [ -z "$TASK_ARN" ] || [ "$TASK_ARN" = "None" ]; then
+            echo "run-task did not start a task" >&2
+            exit 1
+          fi
+          echo "TASK_ARN=$TASK_ARN" >> $GITHUB_ENV
+          echo "TASK_ID=${TASK_ARN##*/}" >> $GITHUB_ENV
+          echo "Started task \`${TASK_ARN##*/}\`" >> $GITHUB_STEP_SUMMARY
+
+      - name: Wait for the task to finish
+        run: |
+          # aws ecs wait tasks-stopped gives up after 10 minutes; the agent can take longer
+          while true; do
+            STATUS=$(aws ecs describe-tasks --cluster "$ECS_CLUSTER" --tasks "$TASK_ARN" \
+              --query 'tasks[0].lastStatus' --output text)
+            echo "$(date +%H:%M:%S) $STATUS"
+            [ "$STATUS" = "STOPPED" ] && break
+            sleep 15
+          done
+
+      - name: Agent logs
+        if: always() && env.TASK_ID != ''
+        run: |
+          aws logs get-log-events \
+            --log-group-name "$LOG_GROUP" \
+            --log-stream-name "$LOG_STREAM_PREFIX/$TASK_ID" \
+            --start-from-head \
+            --query 'events[].message' --output text | tr '\t' '\n' \
+            || echo "No logs (the container may not have started)"
+
+      - name: Result
+        run: |
+          read -r EXIT_CODE STOPPED_REASON <<< "$(aws ecs describe-tasks --cluster "$ECS_CLUSTER" --tasks "$TASK_ARN" \
+            --query 'tasks[0].[containers[0].exitCode, stoppedReason]' --output text)"
+          echo "Exit code: \`$EXIT_CODE\` ($STOPPED_REASON)" >> $GITHUB_STEP_SUMMARY
+          echo "exit code: $EXIT_CODE, reason: $STOPPED_REASON"
+          [ "$EXIT_CODE" = "0" ]
+
+      - name: Stop the task when the run is cancelled
+        if: cancelled() && env.TASK_ARN != ''
+        run: |
+          aws ecs stop-task --cluster "$ECS_CLUSTER" --task "$TASK_ARN" \
+            --reason "GitHub run ${{ github.run_id }} cancelled" --query 'task.lastStatus' --output text
